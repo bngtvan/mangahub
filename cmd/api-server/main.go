@@ -443,6 +443,7 @@ func main() {
 
 	// 4. Register routes on the router
 	server.setupRoutes()
+	server.setupChatRoutes()
 
 	// 5. Start the server on the default port 8080 (or change as needed) [3]
 	fmt.Println("Starting HTTP API server at http://localhost:8080 ...")
