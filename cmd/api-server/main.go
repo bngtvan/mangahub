@@ -37,6 +37,8 @@ func (s *APIServer) setupRoutes() {
 	// Authentication API group
 	auth := s.Router.Group("/auth")
 	{
+		// POST /auth/register
+		// Body: {"username": "string", "password": "string"}
 		auth.POST("/register", func(c *gin.Context) {
 			var req struct {
 				Username string `json:"username"`
@@ -76,6 +78,8 @@ func (s *APIServer) setupRoutes() {
 				},
 			})
 		})
+		// POST /auth/login
+		// Body: {"username": "string", "password": "string"}
 		auth.POST("/login", func(c *gin.Context) {
 			var req struct {
 				Username string `json:"username"`
@@ -199,6 +203,8 @@ func (s *APIServer) setupRoutes() {
 	users := s.Router.Group("/users")
 	users.Use(s.authMiddleware())
 	{
+		// POST /users/library
+		// Body: {"manga_id": "string", "status": "string", "current_chapter": number}
 		// 3. POST /users/library - Add manga to library
 		users.POST("/library", func(c *gin.Context) {
 			var req struct {
@@ -285,6 +291,8 @@ func (s *APIServer) setupRoutes() {
 			c.JSON(http.StatusOK, gin.H{"data": library})
 		})
 
+		// PUT /users/progress
+		// Body: {"manga_id": "string", "chapter": number, "status": "string"}
 		// 3. PUT /users/progress - Update reading progress
 		users.PUT("/progress", func(c *gin.Context) {
 			// Define the payload struct received from the client
