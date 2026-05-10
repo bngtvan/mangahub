@@ -3,13 +3,18 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/golang-jwt/jwt/v4"
+	"golang.org/x/crypto/bcrypt"
 
 	"mangahub/pkg/database"
 	"mangahub/pkg/models"
@@ -21,16 +26,96 @@ type APIServer struct {
 	JWTSecret string
 }
 
+type authClaims struct {
+	UserID   string `json:"user_id"`
+	Username string `json:"username"`
+	jwt.RegisteredClaims
+}
+
 // setupRoutes định nghĩa tất cả các endpoint cần thiết theo đặc tả dự án [2]
 func (s *APIServer) setupRoutes() {
 	// Authentication API group
 	auth := s.Router.Group("/auth")
 	{
 		auth.POST("/register", func(c *gin.Context) {
-			c.JSON(http.StatusOK, gin.H{"message": "POST /auth/register - Register an account (no logic yet)"})
+			var req struct {
+				Username string `json:"username"`
+				Password string `json:"password"`
+			}
+			if err := c.ShouldBindJSON(&req); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
+				return
+			}
+
+			req.Username = strings.TrimSpace(req.Username)
+			if req.Username == "" || len(req.Password) < 6 {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Username is required and password must be at least 6 characters"})
+				return
+			}
+
+			passwordHash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to hash password"})
+				return
+			}
+
+			userID := fmt.Sprintf("user-%d", time.Now().UnixNano())
+			_, err = s.Database.Exec(`
+				INSERT INTO users (id, username, password_hash) VALUES (?, ?, ?)
+			`, userID, req.Username, string(passwordHash))
+			if err != nil {
+				c.JSON(http.StatusConflict, gin.H{"error": "Username already exists"})
+				return
+			}
+
+			c.JSON(http.StatusCreated, gin.H{
+				"message": "User registered successfully",
+				"data": gin.H{
+					"user_id":  userID,
+					"username": req.Username,
+				},
+			})
 		})
 		auth.POST("/login", func(c *gin.Context) {
-			c.JSON(http.StatusOK, gin.H{"message": "POST /auth/login - Log in (no logic yet)"})
+			var req struct {
+				Username string `json:"username"`
+				Password string `json:"password"`
+			}
+			if err := c.ShouldBindJSON(&req); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
+				return
+			}
+
+			var userID, passwordHash string
+			err := s.Database.QueryRow(`
+				SELECT id, password_hash FROM users WHERE username = ?
+			`, strings.TrimSpace(req.Username)).Scan(&userID, &passwordHash)
+			if err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid username or password"})
+					return
+				}
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
+				return
+			}
+
+			if err := bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(req.Password)); err != nil {
+				c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid username or password"})
+				return
+			}
+
+			token, err := s.generateJWT(userID, req.Username)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate token"})
+				return
+			}
+
+			c.JSON(http.StatusOK, gin.H{
+				"message": "Login successful",
+				"data": gin.H{
+					"token": token,
+				},
+			})
 		})
 	}
 
@@ -39,20 +124,30 @@ func (s *APIServer) setupRoutes() {
 		// 1. GET /manga?query=one - Search or list manga
 		manga.GET("", func(c *gin.Context) {
 			queryParam := c.Query("query")
-			var rows *sql.Rows
-			var err error
+			statusParam := c.Query("status")
+			genreParam := c.Query("genre")
 
-			// UC-003: Use a LIKE pattern for search [4]
+			baseQuery := `
+				SELECT id, title, author, genres, status, total_chapters, description
+				FROM manga WHERE 1=1
+			`
+			var args []interface{}
+
 			if queryParam != "" {
-				searchPattern := "%" + queryParam + "%"
-				rows, err = s.Database.Query(`
-					SELECT id, title, author, genres, status, total_chapters, description 
-					FROM manga WHERE title LIKE ?`, searchPattern)
-			} else {
-				rows, err = s.Database.Query(`
-					SELECT id, title, author, genres, status, total_chapters, description 
-					FROM manga`)
+				baseQuery += " AND title LIKE ?"
+				args = append(args, "%"+queryParam+"%")
 			}
+			if statusParam != "" {
+				baseQuery += " AND status = ?"
+				args = append(args, statusParam)
+			}
+			if genreParam != "" {
+				// genres is stored as JSON text, use LIKE for basic filtering.
+				baseQuery += " AND genres LIKE ?"
+				args = append(args, "%"+genreParam+"%")
+			}
+
+			rows, err := s.Database.Query(baseQuery, args...)
 
 			if err != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
@@ -102,12 +197,98 @@ func (s *APIServer) setupRoutes() {
 	}
 
 	users := s.Router.Group("/users")
+	users.Use(s.authMiddleware())
 	{
+		// 3. POST /users/library - Add manga to library
+		users.POST("/library", func(c *gin.Context) {
+			var req struct {
+				MangaID        string `json:"manga_id"`
+				Status         string `json:"status"`
+				CurrentChapter int    `json:"current_chapter"`
+			}
+			if err := c.ShouldBindJSON(&req); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
+				return
+			}
+
+			userID, ok := c.Get("user_id")
+			if !ok {
+				c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+				return
+			}
+
+			req.MangaID = strings.TrimSpace(req.MangaID)
+			if req.MangaID == "" {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "manga_id is required"})
+				return
+			}
+
+			if req.Status == "" {
+				req.Status = "plan_to_read"
+			}
+
+			_, err := s.Database.Exec(`
+				INSERT INTO users_library (user_id, manga_id, status, current_chapter, updated_at)
+				VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+				ON CONFLICT(user_id, manga_id) DO UPDATE SET
+					status = excluded.status,
+					current_chapter = excluded.current_chapter,
+					updated_at = CURRENT_TIMESTAMP
+			`, userID.(string), req.MangaID, req.Status, req.CurrentChapter)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to add manga to library"})
+				return
+			}
+
+			c.JSON(http.StatusOK, gin.H{"message": "Manga added to library"})
+		})
+
+		// 4. GET /users/library - Get user's library
+		users.GET("/library", func(c *gin.Context) {
+			userID, ok := c.Get("user_id")
+			if !ok {
+				c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+				return
+			}
+
+			rows, err := s.Database.Query(`
+				SELECT ul.manga_id, ul.status, ul.current_chapter, ul.updated_at, m.title
+				FROM users_library ul
+				LEFT JOIN manga m ON m.id = ul.manga_id
+				WHERE ul.user_id = ?
+				ORDER BY ul.updated_at DESC
+			`, userID.(string))
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
+				return
+			}
+			defer rows.Close()
+
+			var library []gin.H
+			for rows.Next() {
+				var mangaID, status, updatedAt string
+				var title sql.NullString
+				var currentChapter int
+
+				if err := rows.Scan(&mangaID, &status, &currentChapter, &updatedAt, &title); err != nil {
+					continue
+				}
+				library = append(library, gin.H{
+					"manga_id":        mangaID,
+					"title":           title.String,
+					"status":          status,
+					"current_chapter": currentChapter,
+					"last_updated":    updatedAt,
+				})
+			}
+
+			c.JSON(http.StatusOK, gin.H{"data": library})
+		})
+
 		// 3. PUT /users/progress - Update reading progress
 		users.PUT("/progress", func(c *gin.Context) {
 			// Define the payload struct received from the client
 			var req struct {
-				UserID  string `json:"user_id"` // Temporary body field. In Phase 2, this will come from the JWT token [1, 2]
 				MangaID string `json:"manga_id"`
 				Chapter int    `json:"chapter"`
 				Status  string `json:"status"`
@@ -116,6 +297,11 @@ func (s *APIServer) setupRoutes() {
 			// Validate the JSON body
 			if err := c.ShouldBindJSON(&req); err != nil {
 				c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
+				return
+			}
+			userID, ok := c.Get("user_id")
+			if !ok {
+				c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
 				return
 			}
 
@@ -130,11 +316,21 @@ func (s *APIServer) setupRoutes() {
 				updated_at = CURRENT_TIMESTAMP;
 			`
 
-			_, err := s.Database.Exec(updateQuery, req.UserID, req.MangaID, req.Chapter, req.Status)
+			_, err := s.Database.Exec(updateQuery, userID.(string), req.MangaID, req.Chapter, req.Status)
 			if err != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update progress"})
 				return
 			}
+
+			// Keep users_library status synchronized with progress updates.
+			_, _ = s.Database.Exec(`
+				INSERT INTO users_library (user_id, manga_id, status, current_chapter, updated_at)
+				VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+				ON CONFLICT(user_id, manga_id) DO UPDATE SET
+					status = excluded.status,
+					current_chapter = excluded.current_chapter,
+					updated_at = CURRENT_TIMESTAMP
+			`, userID.(string), req.MangaID, req.Status, req.Chapter)
 
 			// IMPORTANT: TCP broadcast hook [8]
 			// TODO: In Week 4 (Phase 2), you will call a function or channel to forward this data
@@ -146,6 +342,49 @@ func (s *APIServer) setupRoutes() {
 				"data":    req,
 			})
 		})
+	}
+}
+
+func (s *APIServer) generateJWT(userID, username string) (string, error) {
+	claims := authClaims{
+		UserID:   userID,
+		Username: username,
+		RegisteredClaims: jwt.RegisteredClaims{
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)),
+			IssuedAt:  jwt.NewNumericDate(time.Now()),
+		},
+	}
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	return token.SignedString([]byte(s.JWTSecret))
+}
+
+func (s *APIServer) authMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		authHeader := c.GetHeader("Authorization")
+		if !strings.HasPrefix(authHeader, "Bearer ") {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Missing bearer token"})
+			return
+		}
+
+		tokenString := strings.TrimPrefix(authHeader, "Bearer ")
+		token, err := jwt.ParseWithClaims(tokenString, &authClaims{}, func(token *jwt.Token) (interface{}, error) {
+			return []byte(s.JWTSecret), nil
+		})
+		if err != nil || !token.Valid {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Invalid token"})
+			return
+		}
+
+		claims, ok := token.Claims.(*authClaims)
+		if !ok {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Invalid token claims"})
+			return
+		}
+
+		c.Set("user_id", claims.UserID)
+		c.Set("username", claims.Username)
+		c.Next()
 	}
 }
 
@@ -166,14 +405,25 @@ func main() {
 	defer db.Close()
 	fmt.Println("Database schema initialized successfully!")
 
-	// 2. Load dummy data
-	dummyPath, err := database.ResolveProjectPath("data/dummy.json")
-	if err != nil {
-		log.Fatal("Error finding dummy data file: ", err)
+	// 2. Load data
+	dataFiles := []string{
+		"data/manual_input.json",
+		"data/mangadex.json",
+		"data/anilist.json",
 	}
-	err = database.LoadDummyData(db, dummyPath)
+
+	resolvedFiles := make([]string, 0, len(dataFiles))
+	for _, dataFile := range dataFiles {
+		resolvedPath, resolveErr := database.ResolveProjectPath(dataFile)
+		if resolveErr != nil {
+			log.Fatal("Error finding seed data file: ", resolveErr)
+		}
+		resolvedFiles = append(resolvedFiles, resolvedPath)
+	}
+
+	err = database.LoadDataFiles(db, resolvedFiles...)
 	if err != nil {
-		log.Printf("Dummy data load error (it may already be loaded): %v\n", err)
+		log.Printf("Data load error (it may already be loaded): %v\n", err)
 	}
 
 	// 3. Initialize the HTTP API server [1]
