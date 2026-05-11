@@ -22,6 +22,7 @@ func InitDB(dbPath string) (*sql.DB, error) {
 	CREATE TABLE IF NOT EXISTS users (
 		id TEXT PRIMARY KEY,
 		username TEXT UNIQUE,
+		email TEXT UNIQUE,
 		password_hash TEXT,
 		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 	);
@@ -53,6 +54,14 @@ func InitDB(dbPath string) (*sql.DB, error) {
 		added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 		updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 		PRIMARY KEY (user_id, manga_id)
+	);
+
+	-- tcp_outbox stores JSON payloads to retry TCP broadcasts when the TCP server is unavailable
+
+	CREATE TABLE IF NOT EXISTS tcp_outbox (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		payload TEXT NOT NULL,
+		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 	);`
 
 	_, err = db.Exec(schema)
