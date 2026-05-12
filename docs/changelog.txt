@@ -1,0 +1,13 @@
+Manga-Hub v0.1.0, 27-03-2026
+-------------------------------------
+What's new:
+
+* Manga Database (json files)
+
+To-do list:
+
+* JWT-based authentication
+
+Bugs:
+
+* 
